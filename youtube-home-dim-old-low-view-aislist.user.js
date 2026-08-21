@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  // ====== CONFIG ======
+  // ====== CONFIG =======
   const CUTOFF_DAYS = 365;
   const LOW_VIEW_MIN_AGE_DAYS = 1;
   const LOW_VIEW_MAX_VIEWS = 5000;
