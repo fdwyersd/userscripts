@@ -24,7 +24,7 @@ Install a userscript manager such as:
 
 ---
 
-## YouTube Home — Dim Old + Highlight Low-View + AiSList
+## 1) YouTube Home — Dim Old + Highlight Low-View + AiSList
 
 Customizes the YouTube home page to make unusual or potentially interesting videos easier to spot.
 
