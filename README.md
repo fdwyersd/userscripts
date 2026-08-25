@@ -94,4 +94,4 @@ They are tested primarily in Firefox with Violentmonkey.
 
 ## License
 
-Unless otherwise noted, feel free to use, modify, and adapt these scripts for personal use.
+MIT license.
