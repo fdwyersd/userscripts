@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube Home - Dim Old + Highlight Low-View + AiSList
 // @namespace    vm-yt-dim-old2
-// @version      1.3.0
-// @description  Dims old videos, highlights low-view videos yellow, AiSList confirmed channels red/pink, and AiSList warnlist channels orange.
+// @version      1.4.0
+// @description  Dims old videos, highlights low-view videos yellow, AiSList confirmed channels red/pink, and AiSList warnlist channels orange. Supports YouTube compact metadata (3y ago, 1.5M, etc.).
 // @match        https://www.youtube.com/
 // @match        https://www.youtube.com/?*
 // @grant        GM_xmlhttpRequest
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  // ====== CONFIG =======
+  // ====== CONFIG ======
   const CUTOFF_DAYS = 365;
   const LOW_VIEW_MIN_AGE_DAYS = 1;
   const LOW_VIEW_MAX_VIEWS = 5000;
@@ -247,12 +247,13 @@
 
     const str = String(s).trim().toLowerCase();
 
-    const m = str.match(
-      /(\d+)\s+(year|month|week|day|hour|minute)s?\s+ago/
+    // Old YouTube format: "3 years ago", "4 days ago", etc.
+    let m = str.match(
+      /(\d+(?:\.\d+)?)\s+(year|month|week|day|hour|minute)s?\s+ago/
     );
 
     if (m) {
-      const n = parseInt(m[1], 10);
+      const n = parseFloat(m[1]);
       const unit = m[2];
 
       if (!Number.isFinite(n)) return null;
@@ -264,6 +265,48 @@
         case 'day':    return n;
         case 'hour':   return n / 24;
         case 'minute': return n / (60 * 24);
+      }
+    }
+
+    // New compact YouTube format: "3y ago", "1mo ago", "4d ago", "3h ago".
+    // "mo" must be checked before "m", because "m" means minute here.
+    m = str.match(
+      /(\d+(?:\.\d+)?)\s*(y|yr|yrs|mo|mos|w|wk|wks|d|h|hr|hrs|min|mins|m)\s+ago\b/
+    );
+
+    if (m) {
+      const n = parseFloat(m[1]);
+      const unit = m[2];
+
+      if (!Number.isFinite(n)) return null;
+
+      switch (unit) {
+        case 'y':
+        case 'yr':
+        case 'yrs':
+          return n * 365;
+
+        case 'mo':
+        case 'mos':
+          return n * 30;
+
+        case 'w':
+        case 'wk':
+        case 'wks':
+          return n * 7;
+
+        case 'd':
+          return n;
+
+        case 'h':
+        case 'hr':
+        case 'hrs':
+          return n / 24;
+
+        case 'm':
+        case 'min':
+        case 'mins':
+          return n / (60 * 24);
       }
     }
 
@@ -285,7 +328,7 @@
   function parseViewsTextToNumber(s) {
     if (!s) return null;
 
-    const str = String(s).toLowerCase();
+    const str = String(s).trim().toLowerCase();
 
     if (/\bno\s+views\b/.test(str)) return 0;
 
@@ -296,8 +339,9 @@
       return null;
     }
 
+    // Accept both old "1.5M views" and new bare compact counts like "1.5M".
     const m = str.match(
-      /([\d.,]+)\s*([kmb])?\s+views\b/
+      /^\s*([\d.,]+)\s*([kmb])?\s*(?:views?)?\s*$/
     );
 
     if (!m) return null;
@@ -335,25 +379,87 @@
   function getMetaForTile(tile) {
     const txt = tile.innerText || '';
 
+    // Age: support both verbose and compact YouTube forms.
     const ageMatch = txt.match(
-      /(\d+)\s+(year|month|week|day|hour|minute)s?\s+ago/i
+      /(?:\d+(?:\.\d+)?\s+(?:year|month|week|day|hour|minute)s?\s+ago)|(?:\d+(?:\.\d+)?\s*(?:y|yr|yrs|mo|mos|w|wk|wks|d|h|hr|hrs|min|mins|m)\s+ago\b)/i
     );
 
-    const viewsMatch = txt.match(
+    const days =
+      ageMatch
+        ? parseAgeTextToDays(ageMatch[0])
+        : null;
+
+    let views = null;
+
+    // First try the old explicit "... views" format.
+    const verboseViewsMatch = txt.match(
       /(?:no\s+views|[\d.,]+\s*[kmb]?\s+views)/i
     );
 
-    return {
-      days:
-        ageMatch
-          ? parseAgeTextToDays(ageMatch[0])
-          : null,
+    if (verboseViewsMatch) {
+      views = parseViewsTextToNumber(verboseViewsMatch[0]);
+    }
 
-      views:
-        viewsMatch
-          ? parseViewsTextToNumber(viewsMatch[0])
-          : null
-    };
+    // New homepage format commonly displays:
+    //   "1.5M 3y ago"
+    //   "743K 1mo ago"
+    //   "79K 3w ago"
+    // with no word "views".
+    //
+    // Anchor the count to the age token so numbers in titles (e.g. "$69 Billion")
+    // are not mistaken for view counts.
+    if (views == null && ageMatch) {
+      const escapedAge = ageMatch[0]
+        .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+      const pairRegex = new RegExp(
+        '([\\d.,]+)\\s*([kmb])?\\s*(?:[•·]\\s*)?(?=' + escapedAge + ')',
+        'i'
+      );
+
+      const pairMatch = txt.match(pairRegex);
+
+      if (pairMatch) {
+        views = parseViewsTextToNumber(
+          pairMatch[1] + (pairMatch[2] || '')
+        );
+      }
+    }
+
+    // DOM fallback: metadata is often split into individual spans.
+    if (views == null) {
+      const metaNodes = tile.querySelectorAll(
+        '#metadata-line span, ' +
+        'ytd-video-meta-block #metadata-line span, ' +
+        'yt-content-metadata-view-model span, ' +
+        '[class*="metadata"] span'
+      );
+
+      for (const node of metaNodes) {
+        const s = (node.innerText || node.textContent || '').trim();
+
+        if (!s) continue;
+
+        if (/\bviews?\b/i.test(s) || /\bno\s+views\b/i.test(s)) {
+          const v = parseViewsTextToNumber(s);
+          if (v != null) {
+            views = v;
+            break;
+          }
+        }
+
+        // Bare compact count, e.g. "1.5M", "743K", "982".
+        if (/^[\d.,]+\s*[kmb]?$/i.test(s)) {
+          const v = parseViewsTextToNumber(s);
+          if (v != null) {
+            views = v;
+            break;
+          }
+        }
+      }
+    }
+
+    return { days, views };
   }
 
   // ============================================================
