@@ -30,10 +30,11 @@ Customizes the YouTube home page to make unusual or potentially interesting vide
 
 ### What it does
 
-* **Dims videos 1 year old or older**
+* **Dims/removes videos 1 year old or older**
 
   * Old recommendations are displayed with reduced opacity and grayscale.
   * Hovering over them temporarily restores the normal appearance.
+  * Videos > 1y old w/ less than 100k views have tile removed 
 
 * **Highlights low-view videos in yellow**
 
