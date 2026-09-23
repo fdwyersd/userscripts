@@ -1,11 +1,8 @@
 # userscripts
-Violentmonkey userscripts for Reddit, Youtube and other sites
 
-# Userscripts
+Violentmonkey userscripts for Reddit, YouTube, and other sites.
 
-A collection of Violentmonkey userscripts I use to customize Reddit, YouTube, and other websites.
-
-These are small personal utility scripts that change or enhance browser behavior in ways I find useful. They are shared here in case anyone else wants to use or modify them.
+A collection of small personal utility scripts I use to customize browser behavior. They are shared here in case anyone else wants to use or modify them.
 
 ## Requirements
 
@@ -24,17 +21,23 @@ Install a userscript manager such as:
 
 ---
 
+# YouTube Scripts
+
 ## 1) YouTube Home — Dim Old + Highlight Low-View + AiSList
 
 Customizes the YouTube home page to make unusual or potentially interesting videos easier to spot.
 
 ### What it does
 
-* **Dims/removes videos 1 year old or older**
+* **Dims old videos**
 
-  * Old recommendations are displayed with reduced opacity and grayscale.
+  * Recommendations 1 year old or older are displayed with reduced opacity and grayscale.
   * Hovering over them temporarily restores the normal appearance.
-  * Videos > 1y old w/ less than 100k views have tile removed 
+
+* **Removes old, low-view tiles**
+
+  * Videos more than 1 year old with fewer than 100,000 views are removed from the home-page grid.
+  * YouTube can then fill the space with other recommendations.
 
 * **Highlights low-view videos in yellow**
 
@@ -87,7 +90,38 @@ This repository does not maintain or determine those classifications.
 
 ---
 
-## Notes
+## 2) YouTube Live Chat Ding
+
+Adds an audible notification to YouTube Live Chat so selected chat activity can be noticed without constantly watching the chat window.
+
+### What it does
+
+* Plays a short **ding** when configured chat text is detected.
+* Useful while watching long-running livestreams where interesting events may be mentioned in chat before they are obvious on video.
+* Runs directly in YouTube's live-chat interface through Violentmonkey.
+* Does not require modifying the livestream itself.
+
+### Why it exists
+
+I originally made this for livestreams where I might have the video running in the background and want an audible cue when something interesting appears in chat.
+
+Instead of continuously watching the chat window, the script can call attention to matching messages with a short sound.
+
+### Volume behavior
+
+The ding volume can be adjusted independently by the script.
+
+Some versions may also adjust notification volume relative to the YouTube player's current volume so the notification remains noticeable without becoming excessively loud when the stream itself is turned up.
+
+### Configuration
+
+The terms or conditions that trigger the ding can be changed in the script.
+
+Review the configuration section near the beginning of the `.user.js` file before installing if you want different trigger words or behavior.
+
+---
+
+# Notes
 
 These scripts modify websites that can change their HTML and JavaScript without notice. A script that works today may eventually need to be updated after a site redesign.
 
