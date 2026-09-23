@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Home - Dim Old + Highlight Low-View + AiSList
 // @namespace    vm-yt-dim-old2
-// @version      1.5.0
+// @version      1.5.1
 // @description  Dims old videos, hides old low-engagement videos, highlights newer low-view videos yellow, and marks AiSList channels. Supports YouTube compact metadata.
 // @match        https://www.youtube.com/
 // @match        https://www.youtube.com/?*
@@ -629,7 +629,20 @@
     setTimeout(processAll, 1200);
     setTimeout(processAll, 3000);
 
-    new MutationObserver(processAll)
+    // Debounce DOM mutation handling so large UI updates (such as opening
+    // YouTube's subscriptions sidebar) do not trigger hundreds of full-page scans.
+    let processTimer = null;
+
+    function scheduleProcessAll() {
+      clearTimeout(processTimer);
+
+      processTimer = setTimeout(() => {
+        processTimer = null;
+        processAll();
+      }, 200);
+    }
+
+    new MutationObserver(scheduleProcessAll)
       .observe(
         document.documentElement,
         {
