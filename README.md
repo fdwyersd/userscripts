@@ -115,7 +115,7 @@ Some versions may also adjust notification volume relative to the YouTube player
 
 ### Configuration
 
-The terms or conditions that trigger the ding can be changed in the script.
+The terms or conditions that trigger the ding can be changed in the script.  You'll have to edit the URL to your page.
 
 Review the configuration section near the beginning of the `.user.js` file before installing if you want different trigger words or behavior.
 
