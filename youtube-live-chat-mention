@@ -1,0 +1,630 @@
+// ==UserScript==
+// @name         YouTube Live Chat @Mention Chime (Single) - flag my responses
+// @match        https://www.youtube.com/live_chat*
+// @grant        none
+// ==/UserScript==
+//
+// VERSION: 1.1.6
+//
+// CHANGELOG
+// 1.0.0 - Original stable version
+// 1.1.0 - Added Frank / FD matching
+// 1.1.1 - Experimental full-row highlighting
+// 1.1.2 - Experimental row stripe
+// 1.1.3 - Matched-text-only highlighting
+// 1.1.4 - Improved wrapped-message handling
+// 1.1.5 - Matching text is yellow.
+//         Real YouTube @mentions matching me are also forced yellow.
+//         No row/background highlighting.
+// 1.1.6 - Adaptive chime volume.
+//         Chime stays strong when the video is quiet and automatically
+//         ducks as YouTube player volume is raised.
+//
+
+(function () {
+  const VERSION = '1.1.6';
+
+  const HANDLE = 'dwyer';
+  const COOLDOWN_MS = 4000;
+
+  // Adaptive chime gain:
+  // video quiet  -> louder ding
+  // video loud   -> softer ding
+  const CHIME_GAIN_MAX = 0.34;
+  const CHIME_GAIN_MIN = 0.08;
+  const CHIME_GAIN_FALLBACK = 0.21;
+
+  let lastChime = 0;
+
+  let audioCtx = null;
+  let masterGain = null;
+
+
+  // ------------------------------------------------------------
+  // MATCHING
+  // ------------------------------------------------------------
+
+  function matchesMe(text) {
+    if (!text) return false;
+
+    return (
+      /dwyer/i.test(text) ||
+      /\bfrank\b/i.test(text) ||
+      /\bfd\b/i.test(text)
+    );
+  }
+
+
+  // ------------------------------------------------------------
+  // CSS
+  // ------------------------------------------------------------
+
+  const style = document.createElement('style');
+
+  style.textContent = `
+    .mention-chime-match {
+      color: #ffd54f !important;
+      font-weight: 700 !important;
+    }
+
+    .mention-chime-link-match {
+      color: #ffd54f !important;
+      font-weight: 700 !important;
+    }
+
+    .mention-chime-link-match * {
+      color: #ffd54f !important;
+    }
+  `;
+
+  document.head.appendChild(style);
+
+
+  // ------------------------------------------------------------
+  // MY OWN POSTS - ORIGINAL PURPLE HIGHLIGHT
+  // ------------------------------------------------------------
+
+  function highlightMyPost(node) {
+    if (!node || node.nodeType !== 1) return;
+
+    const author = node.querySelector?.('#author-name');
+    if (!author || !author.innerText) return;
+
+    if (
+      author.innerText
+        .toLowerCase()
+        .includes(HANDLE.toLowerCase())
+    ) {
+      author.style.background = '#7b2cff';
+      author.style.color = '#ffffff';
+      author.style.padding = '1px 5px';
+      author.style.borderRadius = '6px';
+      author.style.fontWeight = '700';
+      author.style.boxShadow = '0 0 8px #b48cff';
+    }
+  }
+
+
+  // ------------------------------------------------------------
+  // HIGHLIGHT MATCHING TEXT
+  // ------------------------------------------------------------
+
+  function highlightRenderer(renderer) {
+    if (!renderer) return;
+
+    const message = renderer.querySelector('#message');
+    if (!message) return;
+
+
+    // ----------------------------------------------------------
+    // First handle REAL YouTube clickable @mentions.
+    //
+    // If YouTube created something like:
+    //
+    //     @fdwyer-san-diego
+    //
+    // as a clickable link, make the whole mention yellow.
+    // This overrides YouTube's orange mention color.
+    // ----------------------------------------------------------
+
+    message.querySelectorAll(
+      'a, [role="link"], .yt-simple-endpoint'
+    ).forEach(link => {
+
+      if (matchesMe(link.innerText)) {
+        link.classList.add('mention-chime-link-match');
+      }
+
+    });
+
+
+    // ----------------------------------------------------------
+    // Now handle ordinary text such as:
+    //
+    //     hello fdwyer
+    //     FD did you see that
+    //     hey Frank
+    //
+    // Only the matching characters become yellow.
+    // ----------------------------------------------------------
+
+    const walker = document.createTreeWalker(
+      message,
+      NodeFilter.SHOW_TEXT
+    );
+
+    const textNodes = [];
+
+    while (walker.nextNode()) {
+      textNodes.push(walker.currentNode);
+    }
+
+
+    for (const textNode of textNodes) {
+
+      const parent = textNode.parentElement;
+
+      if (!parent) continue;
+
+
+      // Real clickable mentions were handled above.
+      if (
+        parent.closest('a') ||
+        parent.closest('[role="link"]') ||
+        parent.closest('.yt-simple-endpoint')
+      ) {
+        continue;
+      }
+
+
+      // Don't re-process text we already highlighted.
+      if (
+        parent.closest('.mention-chime-match')
+      ) {
+        continue;
+      }
+
+
+      const text = textNode.nodeValue;
+
+      if (!text || !matchesMe(text)) continue;
+
+
+      // fdwyer is first so the entire word gets highlighted.
+      const regex =
+        /(fdwyer|dwyer|\bfrank\b|\bfd\b)/gi;
+
+
+      const frag =
+        document.createDocumentFragment();
+
+      let lastIndex = 0;
+      let match;
+
+
+      while (
+        (match = regex.exec(text)) !== null
+      ) {
+
+        // Normal text before the match.
+        if (match.index > lastIndex) {
+
+          frag.appendChild(
+            document.createTextNode(
+              text.slice(
+                lastIndex,
+                match.index
+              )
+            )
+          );
+
+        }
+
+
+        // Yellow matching text.
+        const span =
+          document.createElement('span');
+
+        span.className =
+          'mention-chime-match';
+
+        span.textContent =
+          match[0];
+
+        frag.appendChild(span);
+
+
+        lastIndex =
+          regex.lastIndex;
+      }
+
+
+      // Normal text after the final match.
+      if (lastIndex < text.length) {
+
+        frag.appendChild(
+          document.createTextNode(
+            text.slice(lastIndex)
+          )
+        );
+
+      }
+
+
+      textNode.parentNode.replaceChild(
+        frag,
+        textNode
+      );
+    }
+  }
+
+
+  function highlightMention(node) {
+    if (!node || node.nodeType !== 1) return;
+
+    const renderers = new Set();
+
+
+    // Node itself is a chat message.
+    if (
+      node.matches?.(
+        'yt-live-chat-text-message-renderer'
+      )
+    ) {
+      renderers.add(node);
+    }
+
+
+    // Node is somewhere inside a chat message.
+    const parentRenderer =
+      node.closest?.(
+        'yt-live-chat-text-message-renderer'
+      );
+
+    if (parentRenderer) {
+      renderers.add(parentRenderer);
+    }
+
+
+    // Node contains chat messages.
+    node.querySelectorAll?.(
+      'yt-live-chat-text-message-renderer'
+    ).forEach(renderer => {
+      renderers.add(renderer);
+    });
+
+
+    for (const renderer of renderers) {
+      highlightRenderer(renderer);
+    }
+  }
+
+
+  // ------------------------------------------------------------
+  // VIDEO VOLUME / ADAPTIVE CHIME
+  // ------------------------------------------------------------
+
+  function getYouTubeVideoVolume() {
+    // The live chat normally runs inside the YouTube watch page.
+    // Because both frames are youtube.com, we can usually read the
+    // parent/top page's HTML5 video volume directly.
+    const docs = [];
+
+    try {
+      if (window.top && window.top.document) {
+        docs.push(window.top.document);
+      }
+    } catch (e) {}
+
+    try {
+      if (
+        window.parent &&
+        window.parent !== window &&
+        window.parent.document
+      ) {
+        docs.push(window.parent.document);
+      }
+    } catch (e) {}
+
+    docs.push(document);
+
+    for (const doc of docs) {
+      try {
+        const video = doc.querySelector('video');
+
+        if (video) {
+          if (video.muted) return 0;
+
+          if (
+            typeof video.volume === 'number' &&
+            Number.isFinite(video.volume)
+          ) {
+            return Math.max(
+              0,
+              Math.min(1, video.volume)
+            );
+          }
+        }
+      } catch (e) {}
+    }
+
+    return null;
+  }
+
+
+  function getAdaptiveChimeGain() {
+    const videoVolume =
+      getYouTubeVideoVolume();
+
+    if (videoVolume === null) {
+      return CHIME_GAIN_FALLBACK;
+    }
+
+    // Inverse relationship:
+    // 0% video   -> 0.34 gain
+    // 25% video  -> 0.275
+    // 50% video  -> 0.21
+    // 75% video  -> 0.145
+    // 100% video -> 0.08
+    return (
+      CHIME_GAIN_MAX -
+      (
+        CHIME_GAIN_MAX -
+        CHIME_GAIN_MIN
+      ) * videoVolume
+    );
+  }
+
+
+  // ------------------------------------------------------------
+  // AUDIO
+  // ------------------------------------------------------------
+
+  function ensureAudio() {
+    if (!audioCtx) {
+
+      const AC =
+        window.AudioContext ||
+        window.webkitAudioContext;
+
+      audioCtx = new AC();
+
+      masterGain =
+        audioCtx.createGain();
+
+      masterGain.gain.value = 0.28;
+
+      masterGain.connect(
+        audioCtx.destination
+      );
+    }
+
+    if (
+      audioCtx.state === 'suspended'
+    ) {
+      audioCtx.resume().catch(() => {});
+    }
+  }
+
+
+  function playChime() {
+    ensureAudio();
+
+    if (
+      !audioCtx ||
+      audioCtx.state !== 'running'
+    ) return;
+
+
+    const t0 =
+      audioCtx.currentTime;
+
+    const adaptiveGain =
+      getAdaptiveChimeGain();
+
+    masterGain.gain.setValueAtTime(
+      adaptiveGain,
+      t0
+    );
+
+    const fundamental = 1320;
+    const decay = 1.2;
+
+
+    const partials = [
+      [1.0, 1.0],
+      [2.76, 0.35],
+      [5.40, 0.18]
+    ];
+
+
+    partials.forEach(
+      ([mult, level]) => {
+
+        const osc =
+          audioCtx.createOscillator();
+
+        osc.type = 'sine';
+
+        osc.frequency.setValueAtTime(
+          fundamental * mult,
+          t0
+        );
+
+
+        const g =
+          audioCtx.createGain();
+
+        g.gain.setValueAtTime(
+          0.0001,
+          t0
+        );
+
+        g.gain.exponentialRampToValueAtTime(
+          level,
+          t0 + 0.003
+        );
+
+        g.gain.exponentialRampToValueAtTime(
+          0.0001,
+          t0 + decay
+        );
+
+
+        const lp =
+          audioCtx.createBiquadFilter();
+
+        lp.type = 'lowpass';
+
+        lp.frequency.setValueAtTime(
+          6200,
+          t0
+        );
+
+        lp.Q.setValueAtTime(
+          0.6,
+          t0
+        );
+
+
+        osc.connect(g);
+        g.connect(lp);
+        lp.connect(masterGain);
+
+
+        osc.start(t0);
+
+        osc.stop(
+          t0 + decay + 0.05
+        );
+      }
+    );
+  }
+
+
+  function maybeChime() {
+    const now = Date.now();
+
+    if (
+      now - lastChime <
+      COOLDOWN_MS
+    ) return;
+
+    lastChime = now;
+
+    playChime();
+  }
+
+
+  function textMentionsHandle(node) {
+    if (
+      !node ||
+      !node.innerText
+    ) return false;
+
+    return matchesMe(
+      node.innerText
+    );
+  }
+
+
+  // ------------------------------------------------------------
+  // CHAT
+  // ------------------------------------------------------------
+
+  const chatRoot =
+    document.querySelector('#items');
+
+  if (!chatRoot) return;
+
+
+  // Already-loaded messages.
+  chatRoot.querySelectorAll(
+    'yt-live-chat-text-message-renderer'
+  ).forEach(node => {
+
+    highlightMyPost(node);
+    highlightMention(node);
+
+  });
+
+
+  // New messages.
+  const obs =
+    new MutationObserver(muts => {
+
+      for (const m of muts) {
+
+        for (const n of m.addedNodes) {
+
+          if (
+            n.nodeType !== 1
+          ) continue;
+
+
+          // Ignore DOM elements created by this script.
+          if (
+            n.matches?.(
+              '.mention-chime-match'
+            ) ||
+            n.closest?.(
+              '.mention-chime-match'
+            )
+          ) {
+            continue;
+          }
+
+
+          highlightMyPost(n);
+
+          highlightMention(n);
+
+
+          if (
+            textMentionsHandle(n)
+          ) {
+            maybeChime();
+          }
+
+
+          const el =
+            n.querySelector?.(
+              '#message, yt-formatted-string, #content'
+            );
+
+
+          if (
+            el &&
+            textMentionsHandle(el)
+          ) {
+            maybeChime();
+          }
+        }
+      }
+    });
+
+
+  obs.observe(
+    chatRoot,
+    {
+      childList: true,
+      subtree: true
+    }
+  );
+
+
+  window.addEventListener(
+    'pointerdown',
+    ensureAudio,
+    {
+      once: true,
+      capture: true
+    }
+  );
+
+
+  console.log(
+    `[mention-chime v${VERSION}] active for dwyer / fdwyer / Frank / FD - adaptive chime volume enabled`
+  );
+
+})();
