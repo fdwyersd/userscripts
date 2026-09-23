@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube Home - Dim Old + Highlight Low-View + AiSList
 // @namespace    vm-yt-dim-old2
-// @version      1.4.0
-// @description  Dims old videos, highlights low-view videos yellow, AiSList confirmed channels red/pink, and AiSList warnlist channels orange. Supports YouTube compact metadata (3y ago, 1.5M, etc.).
+// @version      1.5.0
+// @description  Dims old videos, hides old low-engagement videos, highlights newer low-view videos yellow, and marks AiSList channels. Supports YouTube compact metadata.
 // @match        https://www.youtube.com/
 // @match        https://www.youtube.com/?*
 // @grant        GM_xmlhttpRequest
@@ -16,6 +16,10 @@
   const CUTOFF_DAYS = 365;
   const LOW_VIEW_MIN_AGE_DAYS = 1;
   const LOW_VIEW_MAX_VIEWS = 5000;
+
+  // Hide videos that are at least 1 year old and have fewer than 100K views.
+  const HIDE_OLD_LOWVIEW_MIN_AGE_DAYS = 365;
+  const HIDE_OLD_LOWVIEW_MAX_VIEWS = 100000;
 
   const DIM_OPACITY = 0.58;
   const DIM_GRAYSCALE = 0.85;
@@ -50,6 +54,7 @@
 
   const CLASS_DIM = 'vm-dim-old-video-tile';
   const CLASS_LOW = 'vm-lowview-video-tile';
+  const CLASS_HIDE = 'vm-hide-old-lowview-video-tile';
   const CLASS_AI_BLOCK = 'vm-aislist-block-video-tile';
   const CLASS_AI_WARN = 'vm-aislist-warn-video-tile';
 
@@ -79,6 +84,10 @@
       .${CLASS_DIM}:hover {
         opacity: 1 !important;
         filter: none !important;
+      }
+
+      .${CLASS_HIDE} {
+        display: none !important;
       }
 
       .${CLASS_LOW} {
@@ -532,6 +541,7 @@
     tile.classList.remove(
       CLASS_DIM,
       CLASS_LOW,
+      CLASS_HIDE,
       CLASS_AI_BLOCK,
       CLASS_AI_WARN
     );
@@ -556,14 +566,26 @@
       return;
     }
 
-    // EXISTING RULES
+    // VIDEO AGE / ENGAGEMENT RULES
     if (meta.days == null) return;
 
+    // Hide old + low-engagement videos completely so the grid can reflow.
+    if (
+      meta.days >= HIDE_OLD_LOWVIEW_MIN_AGE_DAYS &&
+      meta.views != null &&
+      meta.views < HIDE_OLD_LOWVIEW_MAX_VIEWS
+    ) {
+      tile.classList.add(CLASS_HIDE);
+      return;
+    }
+
+    // Other old videos remain visible but dimmed.
     if (meta.days >= CUTOFF_DAYS) {
       tile.classList.add(CLASS_DIM);
       return;
     }
 
+    // Newer low-view videos get the existing yellow treatment.
     if (
       meta.days >= LOW_VIEW_MIN_AGE_DAYS &&
       meta.views != null &&
