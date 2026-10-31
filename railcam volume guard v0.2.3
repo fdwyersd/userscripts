@@ -1,0 +1,743 @@
+// ==UserScript==
+// @name Railcam Volume Guard
+// @namespace railcam-rain-volume
+// @version 0.2.3
+// @description Keep your listening volume, turn down trains, horns and other loud sounds, then restore the volume after sustained quiet.
+// @include https://www.youtube.com/watch?v=X-ir2KfXMX0
+// @run-at document-idle
+// @grant none
+// @inject-into auto
+// @noframes
+// ==/UserScript==
+
+/*
+UPDATE: Open your existing Railcam Rain Volume / Railcam Volume Guard script
+in Violentmonkey, replace its contents with this entire file, and save.
+Refresh the YouTube tab and click Enable again. For a first installation,
+choose New script instead.
+
+FIRST USE: Set YouTube to a comfortable listening volume for quiet background
+sounds, including rain. Click Enable in the bottom-left panel, then Learn
+background during five seconds with no passing train or other loud noise.
+The guard turns down any sound above your threshold: trains, horns, thunder,
+wind noise, or anything else loud. It restores your listening volume after
+15 continuous seconds of quiet. Choose mute or a reduced volume as preferred.
+Test dip lets you try the reduction and restoration without waiting for noise.
+
+This processes this tab's video audio locally. It requests no microphone,
+does not record, and makes no network requests. Your YouTube volume setting
+is left in place; the guard applies a separate reduction after it. Enable is
+deliberately not remembered across reloads or navigation to another video.
+There is a 250 ms audio delay while enabled, giving the detector a head start.
+Hide panel keeps the guard running and leaves a small Show controls button.
+Drag the panel title bar to move it. Its position is remembered.
+Sample interval controls actual loudness checks, from 10 to 1000 ms. The
+saved slider setting is remembered. Larger intervals reduce detector work but
+can miss short noises between checks. Above 200 ms, sudden sounds can be heard
+before reduction because the audio head start remains 250 ms. Audio playback
+still processes continuously. Background learning temporarily uses 10 ms checks.
+If any audio trouble occurs, click Disable. Reloading resets the audio graph.
+*/
+
+(() => {
+  'use strict';
+
+  const INSTANCE = '__railcamRainVolume01';
+  if (window[INSTANCE]) return;
+  window[INSTANCE] = true;
+
+  // TUNING: the saved slider setting takes precedence over this default.
+  // Once an interval is chosen, it can be fixed here and the saved override removed.
+  const DEFAULT_SAMPLE_INTERVAL_MS = 100;
+
+  // BEGIN AUDIO ENGINE. Shared by the audio worklet and compatibility mode.
+  class RainGuardEngine {
+    constructor(rate, options = {}) {
+      this.rate = rate;
+      this.delaySize = Math.max(1, Math.round(rate * 0.25));
+      this.rings = [new Float32Array(this.delaySize), new Float32Array(this.delaySize)];
+      this.writePosition = 0;
+      // Each check measures the same short 10 ms window as v0.2.2. Longer
+      // intervals SKIP analysis between these windows, rather than diluting
+      // brief loud sounds into a long average. Audio itself is never skipped.
+      this.windowSize = Math.max(1, Math.round(rate * 0.01));
+      this.windowCount = 0;
+      this.energy = 0;
+      this.skipSamples = 0;
+      this.sinceCheck = 0;
+      this.sampleIntervalMs = 10;
+      this.checkEvery = this.windowSize;
+      this.learning = false;
+      this.db = -100;
+      this.low = false;
+      this.quietSamples = 0;
+      this.quietCounting = false;
+      this.gain = 1;
+      this.forcedSamples = 0;
+      this.attack = 1 - Math.exp(-1 / (rate * 0.005));
+      this.release = 1 - Math.exp(-1 / (rate * 0.5));
+      this.configure({ thresholdDb: -30, quietSeconds: 15, reducedGain: 0, playing: true, ...options });
+    }
+
+    configure(options) {
+      if (Number.isFinite(options.thresholdDb)) this.thresholdDb = Math.min(-5, Math.max(-70, options.thresholdDb));
+      if (Number.isFinite(options.quietSeconds)) this.quietSeconds = Math.min(120, Math.max(2, options.quietSeconds));
+      if (Number.isFinite(options.reducedGain)) this.reducedGain = Math.min(0.5, Math.max(0, options.reducedGain));
+      const wasPlaying = this.playing;
+      if (typeof options.playing === 'boolean') this.playing = options.playing;
+      if (Number.isFinite(options.sampleIntervalMs)) {
+        this.sampleIntervalMs = Math.min(1000, Math.max(10, Math.round(options.sampleIntervalMs / 10) * 10));
+      }
+      if (typeof options.learning === 'boolean') this.learning = options.learning;
+      const every = Math.max(this.windowSize, Math.round(this.rate *
+        (this.learning ? 10 : this.sampleIntervalMs) / 1000));
+      if (every !== this.checkEvery || wasPlaying !== this.playing) {
+        this.checkEvery = every;
+        // Recheck promptly when changing the interval or resuming playback.
+        // Keep the current reduction and quiet progress intact.
+        this.skipSamples = 0;
+        this.windowCount = 0;
+        this.energy = 0;
+        this.sinceCheck = 0;
+      }
+    }
+
+    reportIntervalSamples() {
+      // Learning needs about 50 readings in five seconds, regardless of the slider.
+      return Math.max(1, Math.round(this.rate *
+        (this.learning ? 100 : Math.max(200, this.sampleIntervalMs)) / 1000));
+    }
+
+    testDip() {
+      this.forcedSamples = Math.round(this.rate * 2);
+      this.low = true;
+      this.quietSamples = 0;
+      this.quietCounting = false;
+      this.sinceCheck = 0;
+    }
+
+    advance(count) {
+      if (!this.playing) return;
+      const held = Math.min(this.forcedSamples, count);
+      this.forcedSamples -= held;
+      // Forced test time is never counted as quiet, even when a slow check
+      // spans the end of the two-second test.
+      if (held > 0) {
+        this.quietSamples = 0;
+        this.quietCounting = false;
+        this.sinceCheck = 0;
+      }
+      this.sinceCheck += count - held;
+    }
+
+    checkLevel() {
+      this.db = 10 * Math.log10(Math.max(1e-10, this.energy / this.windowCount));
+      if (this.playing) {
+        if (this.forcedSamples > 0 || this.db >= this.thresholdDb) {
+          this.low = true;
+          this.quietSamples = 0;
+          this.quietCounting = false;
+        } else if (this.low) {
+          // Use elapsed AUDIO frames, including the gaps between checks. The
+          // restore delay therefore stays in seconds as the slider changes.
+          if (this.db < this.thresholdDb - 3) {
+            // Begin with the first observed quiet window. Do not count the
+            // unobserved gap before it as quiet after a train or Test dip.
+            this.quietSamples += this.quietCounting ? this.sinceCheck :
+              Math.min(this.windowCount, this.sinceCheck);
+            this.quietCounting = true;
+          } else {
+            this.quietSamples = 0;
+            this.quietCounting = false;
+          }
+          if (this.quietSamples >= this.quietSeconds * this.rate) {
+            this.low = false;
+            this.quietSamples = 0;
+            this.quietCounting = false;
+          }
+        }
+      }
+      this.energy = 0;
+      this.windowCount = 0;
+      this.sinceCheck = 0;
+      this.skipSamples = this.checkEvery - this.windowSize;
+    }
+
+    process(inputs, outputs) {
+      const left = inputs[0];
+      const right = inputs[1] || left;
+      const length = outputs[0].length;
+      // Analyze only the scheduled 10 ms windows. Skip whole ranges of audio
+      // between checks, with no per-sample detector loop during those gaps.
+      let offset = 0;
+      while (offset < length) {
+        if (this.skipSamples > 0) {
+          const count = Math.min(this.skipSamples, length - offset);
+          this.skipSamples -= count;
+          this.advance(count);
+          offset += count;
+        } else {
+          const count = Math.min(this.windowSize - this.windowCount, length - offset);
+          const end = offset + count;
+          for (let i = offset; i < end; i++) {
+            const l = left ? left[i] || 0 : 0;
+            const r = right ? right[i] || 0 : l;
+            // Measure the louder channel; opposite polarities cannot cancel.
+            this.energy += Math.max(l * l, r * r);
+          }
+          this.windowCount += count;
+          this.advance(count);
+          offset = end;
+          if (this.windowCount >= this.windowSize) this.checkLevel();
+        }
+      }
+
+      // Delay and playback must remain continuous. Avoid recalculating a gain
+      // envelope when it has already settled, and avoid a modulo per sample.
+      const target = this.low ? this.reducedGain : 1;
+      const coefficient = target < this.gain ? this.attack : this.release;
+      const fading = this.gain !== target;
+      let gain = this.gain;
+      let p = this.writePosition;
+      const ringLeft = this.rings[0];
+      const ringRight = this.rings[1];
+      const outLeft = outputs[0];
+      const outRight = outputs[1];
+      for (let i = 0; i < length; i++) {
+        if (fading && gain !== target) {
+          gain += (target - gain) * coefficient;
+          if (Math.abs(target - gain) < 1e-6) gain = target;
+        }
+        const l = left ? left[i] || 0 : 0;
+        const r = right ? right[i] || 0 : l;
+        outLeft[i] = ringLeft[p] * gain;
+        if (outRight) outRight[i] = ringRight[p] * gain;
+        ringLeft[p] = l;
+        ringRight[p] = r;
+        if (++p === this.delaySize) p = 0;
+      }
+      this.writePosition = p;
+      this.gain = gain;
+    }
+
+    report() {
+      return {
+        db: this.db,
+        low: this.low,
+        quietFor: this.quietSamples / this.rate,
+        gain: this.gain,
+        playing: this.playing,
+        testing: this.forcedSamples > 0
+      };
+    }
+  }
+  // END AUDIO ENGINE.
+
+  const WORKLET_NAME = 'railcam-rain-volume-01';
+  function workletCode() {
+    return `${RainGuardEngine.toString()}
+      class RainVolumeProcessor extends AudioWorkletProcessor {
+        constructor(options) {
+          super();
+          this.engine = new RainGuardEngine(sampleRate, options.processorOptions || {});
+          this.reportSamples = 0;
+          this.port.onmessage = event => {
+            if (event.data.type === 'settings') this.engine.configure(event.data.options);
+            if (event.data.type === 'test') this.engine.testDip();
+          };
+        }
+        process(inputs, outputs) {
+          if (!outputs[0] || !outputs[0][0]) return true;
+          this.engine.process(inputs[0] || [], outputs[0]);
+          this.reportSamples += outputs[0][0].length;
+          if (this.reportSamples >= this.engine.reportIntervalSamples()) {
+            this.reportSamples = 0;
+            this.port.postMessage(this.engine.report());
+          }
+          return true;
+        }
+      }
+      registerProcessor('${WORKLET_NAME}', RainVolumeProcessor);`;
+  }
+
+  const STORAGE_KEY = 'railcam-rain-volume-settings-v01';
+  const POSITION_KEY = 'railcam-rain-volume-position-v01';
+  let panelPosition = null;
+  let panelDrag = null;
+  try {
+    const saved = JSON.parse(localStorage.getItem(POSITION_KEY) || 'null');
+    if (saved && Number.isFinite(saved.left) && Number.isFinite(saved.top)) panelPosition = saved;
+  } catch (_) { /* Use the bottom-left corner by default. */ }
+  const records = new WeakMap();
+  let settings = { thresholdDb: -30, quietSeconds: 15, reducedGain: 0,
+    sampleIntervalMs: DEFAULT_SAMPLE_INTERVAL_MS };
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+    if (saved) {
+      for (const key of Object.keys(settings)) {
+        if (Number.isFinite(saved[key])) settings[key] = saved[key];
+      }
+    }
+  } catch (_) { /* Defaults work when local storage is unavailable. */ }
+  settings.thresholdDb = Math.min(-5, Math.max(-70, settings.thresholdDb));
+  settings.quietSeconds = Math.min(120, Math.max(2, settings.quietSeconds));
+  if (![0, 0.02, 0.05, 0.1, 0.2].includes(settings.reducedGain)) settings.reducedGain = 0;
+
+  settings.sampleIntervalMs = Math.min(1000, Math.max(10, Math.round(settings.sampleIntervalMs / 10) * 10));
+
+  let active = null;
+  let starting = false;
+  let generation = 0;
+  let learning = null;
+  let lastVideoId = videoId();
+  let lastReportAt = 0;
+  let lastReport = null;
+  let noSignalSince = 0;
+
+  const host = document.createElement('div');
+  host.id = 'railcam-rain-volume';
+  host.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:2147483646;display:none;';
+  const root = host.attachShadow({ mode: 'open' });
+  root.innerHTML = `
+    <style>
+      :host { color-scheme:dark; }
+      * { box-sizing:border-box; }
+      section { width:310px; max-width:calc(100vw - 32px); max-height:calc(100vh - 16px);
+        overflow:auto; background:#14202a;
+        color:#edf4f8; border:1px solid #506676; border-radius:12px;
+        box-shadow:0 6px 24px #0008; font:13px/1.4 Arial,sans-serif; padding:13px; }
+      header { display:flex; align-items:center; justify-content:space-between; gap:8px;
+        cursor:move; user-select:none; touch-action:none; }
+      strong { font-size:15px; } small { font-size:11px; color:#a9becd; }
+      button,select,input { font:inherit; }
+      button { cursor:pointer; background:#2b4050; color:#edf4f8; border:1px solid #658295;
+        border-radius:6px; padding:6px 9px; }
+      button:hover { background:#3c566a; }
+      button:disabled { opacity:.45; cursor:default; }
+      #toggle { background:#176d56; font-weight:bold; }
+      #toggle.running { background:#815128; }
+      #fold { padding:2px 8px; font-size:17px; }
+      #show { font:12px/1.4 Arial,sans-serif; padding:6px 9px; opacity:.8;
+        box-shadow:0 2px 8px #0006; }
+      #show:hover, #show:focus { opacity:1; }
+      #status { margin:9px 0 7px; font-weight:bold; color:#a9d9ee; min-height:19px; }
+      #message { margin:8px 0; color:#c5d6e1; }
+      #message:empty { display:none; }
+      .row { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:10px 0; }
+      .buttons { display:flex; flex-wrap:wrap; gap:6px; margin-top:11px; }
+      .meter { height:10px; border-radius:5px; background:#091118; position:relative; overflow:hidden; }
+      #level { height:100%; width:0; background:#55b88e; }
+      #cutoff { position:absolute; top:0; bottom:0; width:2px; background:#ffd077; }
+      #threshold, #sample { width:100%; margin:5px 0; accent-color:#ffd077; }
+      #sampleHint { font-size:11px; color:#a9becd; margin:4px 0 10px; }
+      #quiet { width:59px; }
+      select,input[type=number] { background:#0b151e; color:#edf4f8; border:1px solid #658295;
+        border-radius:4px; padding:4px; }
+      label { color:#d5e4ee; }
+      output { font-variant-numeric:tabular-nums; }
+      details { color:#a9becd; font-size:12px; margin-top:10px; }
+      summary { cursor:pointer; }
+      details p { margin:6px 0; }
+      [hidden] { display:none !important; }
+    </style>
+    <section id="panel" aria-label="Railcam volume controls">
+      <header id="drag" title="Drag here to move the panel"><strong>Volume guard <small>v0.2.3</small></strong>
+        <button id="fold" aria-label="Collapse controls" aria-expanded="true">−</button></header>
+      <div id="status" role="status" aria-live="polite">Off</div>
+      <div class="buttons"><button id="toggle" type="button">Enable</button>
+        <button id="hide" type="button" aria-controls="panel">Hide panel</button></div>
+      <div id="body">
+        <p id="message">Set your listening volume, then Enable.</p>
+        <div class="row"><span>Incoming sound</span><output id="db">—</output></div>
+        <div class="meter" aria-hidden="true"><div id="level"></div><div id="cutoff"></div></div>
+        <div class="row"><label for="threshold">Turn down above</label><output id="thresholdValue"></output></div>
+        <input id="threshold" type="range" min="-70" max="-5" step="1">
+        <div class="row"><label for="sample">Sample interval</label><output id="sampleValue"></output></div>
+        <input id="sample" type="range" min="10" max="1000" step="10">
+        <p id="sampleHint"></p>
+        <div class="row"><label for="reduced">During loud sounds</label>
+          <select id="reduced"><option value="0">Mute</option><option value="0.02">2% of normal</option>
+            <option value="0.05">5% of normal</option><option value="0.1">10% of normal</option>
+            <option value="0.2">20% of normal</option></select></div>
+        <div class="row"><label for="quiet">Seconds of quiet to restore</label>
+          <input id="quiet" type="number" min="2" max="120" step="1"></div>
+        <div class="buttons"><button id="learn" type="button" disabled>Learn background (5 s)</button>
+          <button id="test" type="button" disabled>Test dip</button></div>
+        <details><summary>How to adjust</summary>
+          <p>Enable, then Learn background during quiet sounds you want to hear, such as rain. Avoid passing trains or horns while learning. It sets the trigger 10 dB above the louder background readings.</p>
+          <p>A more negative trigger catches quieter sounds: −40 is more sensitive than −20. Loud sound resets the quiet timer.</p>
+          <p>Your YouTube volume stays where you set it. If you change it, learn the background again. Levels describe the stream, not room loudness.</p>
+          <p>Sample interval changes actual loudness checks. 10 ms matches the original detector; 100 ms is a starting point for lower overhead. Larger values can miss brief sounds. Above 200 ms, sudden sounds can be heard before reduction. Playback stays continuous. Learning temporarily uses fast checks.</p>
+          <p>Test dip turns the sound down for two seconds, then waits for your quiet timer before bringing it back. Disable restores ordinary playback.</p>
+        </details>
+      </div>
+    </section>
+    <button id="show" type="button" aria-controls="panel" aria-expanded="false" hidden>Show volume controls</button>`;
+  document.documentElement.appendChild(host);
+  const ui = {};
+  for (const id of ['panel', 'drag', 'hide', 'show', 'toggle', 'fold', 'body', 'status', 'message', 'db', 'level', 'cutoff',
+    'threshold', 'thresholdValue', 'sample', 'sampleValue', 'sampleHint', 'reduced', 'quiet', 'learn', 'test']) ui[id] = root.getElementById(id);
+
+  function movePanel(left, top, remember = false) {
+    const box = host.getBoundingClientRect();
+    const width = box.width || 310;
+    const height = box.height || 100;
+    panelPosition = {
+      left: Math.round(Math.min(Math.max(8, window.innerWidth - width - 8), Math.max(8, left))),
+      top: Math.round(Math.min(Math.max(8, window.innerHeight - height - 8), Math.max(8, top)))
+    };
+    host.style.left = `${panelPosition.left}px`;
+    host.style.top = `${panelPosition.top}px`;
+    host.style.bottom = 'auto';
+    if (remember) {
+      try { localStorage.setItem(POSITION_KEY, JSON.stringify(panelPosition)); } catch (_) { /* Optional. */ }
+    }
+  }
+
+  function settlePanel() {
+    if (panelPosition && host.style.display !== 'none') {
+      movePanel(panelPosition.left, panelPosition.top);
+    }
+  }
+
+  function videoId() {
+    const url = new URL(location.href);
+    return url.origin === 'https://www.youtube.com' && url.pathname === '/watch' &&
+      url.searchParams.get('v') === 'X-ir2KfXMX0' ? 'X-ir2KfXMX0' : '';
+  }
+
+  function playing(video) {
+    return !video.paused && !video.ended && !video.seeking && video.readyState >= 3;
+  }
+
+  function message(text) {
+    if (ui.message.textContent !== text) ui.message.textContent = text;
+  }
+
+  function paintSampleInterval(value) {
+    ui.sample.value = value;
+    ui.sampleValue.textContent = `${value} ms`;
+    ui.sampleHint.textContent = value > 200 ?
+      'Slower checks: brief noises may be missed, and sudden sounds may be heard before reduction.' :
+      'Larger intervals do less detector work but can miss brief noises. Your choice is remembered.';
+  }
+
+  function updateSettings() {
+    ui.threshold.value = settings.thresholdDb;
+    ui.thresholdValue.textContent = `${settings.thresholdDb} dB`;
+    paintSampleInterval(settings.sampleIntervalMs);
+    ui.quiet.value = settings.quietSeconds;
+    ui.reduced.value = String(settings.reducedGain);
+    ui.cutoff.style.left = `${(settings.thresholdDb + 80) / 80 * 100}%`;
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(settings)); } catch (_) { /* Optional. */ }
+    if (active) active.adapter.configure(settings);
+  }
+
+  function buttons() {
+    ui.toggle.disabled = starting;
+    ui.toggle.textContent = starting ? 'Starting…' : active ? 'Disable' : 'Enable';
+    ui.toggle.classList.toggle('running', !!active);
+    ui.learn.disabled = !active || !!learning;
+    ui.test.disabled = !active || !!learning;
+    ui.sample.disabled = !!learning;
+  }
+
+  function paintReport(report) {
+    if (ui.panel.hidden || host.style.display === 'none' || document.visibilityState === 'hidden') return;
+    if (!ui.body.hidden) {
+      ui.db.textContent = `${Math.round(report.db)} dB`;
+      ui.level.style.width = `${Math.min(100, Math.max(0, (report.db + 80) / 80 * 100))}%`;
+      ui.level.style.background = report.db >= settings.thresholdDb ? '#eda45a' : '#55b88e';
+    }
+    let status;
+    if (!report.playing) status = 'Paused / waiting for stream';
+    else if (report.testing) status = 'Test: volume turned down';
+    else if (report.low && report.quietFor > 0) {
+      status = `Quiet: restoring in ${Math.ceil(Math.max(0, settings.quietSeconds - report.quietFor))} s`;
+    } else if (report.low) status = 'Loud sound: volume turned down';
+    else if (report.gain < 0.99) status = 'Bringing your listening volume back';
+    else status = 'Playing at your listening volume';
+    if (ui.status.textContent !== status) ui.status.textContent = status;
+  }
+
+  function receiveReport(report) {
+    if (!active) return;
+    lastReportAt = performance.now();
+    lastReport = report;
+    paintReport(report);
+    if (report.playing && report.db <= -99) {
+      if (!noSignalSince) noSignalSince = lastReportAt;
+      if (lastReportAt - noSignalSince > 5000) {
+        message('No measurable audio. Check YouTube is playing and unmuted. If enabling made it silent, Disable and reload this tab.');
+      }
+    } else noSignalSince = 0;
+    if (learning) {
+      if (!report.playing) {
+        learning = null;
+        active.adapter.configure({ learning: false });
+        message('Background learning stopped because the stream paused. Try again during quiet background sound.');
+        buttons();
+        return;
+      }
+      learning.readings.push(report.db);
+      const elapsed = performance.now() - learning.started;
+      message(`Learning background… ${Math.max(1, Math.ceil((5000 - elapsed) / 1000))} s. Let only quiet background sound play.`);
+      if (elapsed >= 5000) {
+        const readings = learning.readings.filter(value => value > -90).sort((a, b) => a - b);
+        learning = null;
+        active.adapter.configure({ learning: false });
+        if (readings.length < 20) message('Not enough background audio to learn. Check playback and try again.');
+        else {
+          const rainDb = readings[Math.floor((readings.length - 1) * 0.9)];
+          settings.thresholdDb = Math.min(-5, Math.max(-70, Math.round(rainDb + 10)));
+          updateSettings();
+          message(`Background learned. Trigger set to ${settings.thresholdDb} dB. Adjust the slider if needed.`);
+        }
+        buttons();
+      }
+    }
+  }
+
+  async function createAdapter(record, options) {
+    const context = record.context;
+    if (context.audioWorklet && typeof AudioWorkletNode === 'function') {
+      try {
+        if (!record.moduleLoaded) {
+          const url = URL.createObjectURL(new Blob([workletCode()], { type: 'application/javascript' }));
+          try { await context.audioWorklet.addModule(url); record.moduleLoaded = true; }
+          finally { URL.revokeObjectURL(url); }
+        }
+        const node = new AudioWorkletNode(context, WORKLET_NAME, {
+          numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2],
+          channelCount: 2, channelCountMode: 'explicit', processorOptions: options
+        });
+        node.port.onmessage = event => receiveReport(event.data);
+        node.onprocessorerror = () => disable('Audio processor stopped. Guard disabled. Reload this tab if sound does not return.');
+        return {
+          node,
+          configure: config => node.port.postMessage({ type: 'settings', options: config }),
+          test: () => node.port.postMessage({ type: 'test' }),
+          destroy: () => { node.port.onmessage = null; node.onprocessorerror = null; node.disconnect(); node.port.close(); },
+          compatibility: false
+        };
+      } catch (error) {
+        console.info('[Volume guard] Using compatibility audio mode:', error.message);
+      }
+    }
+    const engine = new RainGuardEngine(context.sampleRate, options);
+    const node = context.createScriptProcessor(1024, 2, 2);
+    let reportSamples = 0;
+    node.onaudioprocess = event => {
+      const input = event.inputBuffer;
+      const output = event.outputBuffer;
+      engine.process([input.getChannelData(0), input.getChannelData(1)],
+        [output.getChannelData(0), output.getChannelData(1)]);
+      reportSamples += output.length;
+      if (reportSamples >= engine.reportIntervalSamples()) {
+        reportSamples = 0;
+        receiveReport(engine.report());
+      }
+    };
+    return {
+      node, configure: config => engine.configure(config), test: () => engine.testDip(),
+      destroy: () => { node.onaudioprocess = null; node.disconnect(); }, compatibility: true
+    };
+  }
+
+  async function enable() {
+    if (starting || active) return;
+    const video = document.querySelector('video.html5-main-video') || document.querySelector('video');
+    if (!videoId() || !video) { message('Open the railcam video first.'); return; }
+    if (!playing(video) || video.muted || video.volume === 0) {
+      message('Play and unmute YouTube, set your listening volume, then Enable.'); return;
+    }
+    const token = ++generation;
+    const targetId = videoId();
+    starting = true;
+    buttons();
+    let record = records.get(video);
+    let adapter = null;
+    try {
+      if (!record) {
+        record = { context: new AudioContext(), source: null, moduleLoaded: false };
+        records.set(video, record);
+      }
+      // Resume within the user's click. A source already attached to an element
+      // must remain routed through this context even when the guard is off.
+      await record.context.resume();
+      adapter = await createAdapter(record, { ...settings, playing: playing(video) });
+      if (token !== generation || videoId() !== targetId || !video.isConnected) {
+        adapter.destroy(); return;
+      }
+      if (!record.source) {
+        record.source = record.context.createMediaElementSource(video);
+        record.source.connect(record.context.destination);
+      }
+      adapter.node.connect(record.context.destination);
+      record.source.connect(adapter.node);
+      record.source.disconnect(record.context.destination);
+      active = { video, record, adapter, targetId, isPlaying: playing(video), cleanup: [] };
+      const syncPlayback = () => {
+        if (active && active.video === video) syncPlaying();
+      };
+      for (const event of ['playing', 'pause', 'waiting', 'stalled', 'ended', 'seeking', 'seeked', 'canplay']) {
+        video.addEventListener(event, syncPlayback);
+        active.cleanup.push(() => video.removeEventListener(event, syncPlayback));
+      }
+      lastReport = null;
+      lastReportAt = performance.now();
+      noSignalSince = 0;
+      ui.status.textContent = 'Listening to incoming audio…';
+      message(adapter.compatibility ? 'Enabled in compatibility mode. Click Learn background during quiet background sound.' :
+        'Enabled. Click Learn background during quiet background sound, then try Test dip.');
+    } catch (error) {
+      if (adapter) adapter.destroy();
+      if (record && record.source) {
+        try { record.source.disconnect(); record.source.connect(record.context.destination); } catch (_) { /* Reload resets it. */ }
+      }
+      console.warn('[Volume guard]', error);
+      message(`Could not enable: ${error.message}. If sound changed, reload this tab.`);
+    } finally {
+      if (token === generation) { starting = false; buttons(); }
+    }
+  }
+
+  function syncPlaying() {
+    if (!active) return;
+    const isPlaying = playing(active.video);
+    if (isPlaying !== active.isPlaying) {
+      active.isPlaying = isPlaying;
+      active.adapter.configure({ playing: isPlaying });
+    }
+  }
+
+  function disable(reason = 'Off. Your normal YouTube volume is restored.') {
+    generation++;
+    starting = false;
+    learning = null;
+    const previous = active;
+    active = null;
+    if (previous) {
+      for (const cleanup of previous.cleanup) cleanup();
+      try { previous.record.source.disconnect(); } catch (_) { /* Already disconnected. */ }
+      // Do not close or suspend: a media element cannot be detached from a
+      // MediaElementAudioSourceNode without reloading the page.
+      previous.record.source.connect(previous.record.context.destination);
+      previous.adapter.destroy();
+    }
+    ui.status.textContent = 'Off';
+    ui.level.style.width = '0%';
+    ui.db.textContent = '—';
+    message(reason);
+    buttons();
+  }
+
+  ui.toggle.addEventListener('click', () => active ? disable() : enable());
+  ui.threshold.addEventListener('input', () => {
+    settings.thresholdDb = Number(ui.threshold.value); updateSettings();
+  });
+  // Preview while dragging; apply and persist once on release, avoiding a
+  // stream of localStorage writes and audio-thread messages during the drag.
+  ui.sample.addEventListener('input', () => paintSampleInterval(Number(ui.sample.value)));
+  ui.sample.addEventListener('change', () => {
+    settings.sampleIntervalMs = Math.min(1000, Math.max(10, Math.round(Number(ui.sample.value) / 10) * 10));
+    updateSettings();
+  });
+  ui.reduced.addEventListener('change', () => {
+    settings.reducedGain = Number(ui.reduced.value); updateSettings();
+  });
+  ui.quiet.addEventListener('change', () => {
+    const value = Number(ui.quiet.value);
+    settings.quietSeconds = Number.isFinite(value) ? Math.min(120, Math.max(2, Math.round(value))) : 15;
+    updateSettings();
+  });
+  ui.drag.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || event.target.closest('button, input, select, a')) return;
+    const box = host.getBoundingClientRect();
+    panelDrag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: box.left, top: box.top };
+    movePanel(box.left, box.top);
+    try { ui.drag.setPointerCapture(event.pointerId); } catch (_) { /* Best effort. */ }
+    event.preventDefault();
+  });
+  ui.drag.addEventListener('pointermove', event => {
+    if (!panelDrag || event.pointerId !== panelDrag.id) return;
+    movePanel(panelDrag.left + event.clientX - panelDrag.x, panelDrag.top + event.clientY - panelDrag.y);
+    event.preventDefault();
+  });
+  function finishDrag(event) {
+    if (!panelDrag || event.pointerId !== panelDrag.id) return;
+    panelDrag = null;
+    if (panelPosition) movePanel(panelPosition.left, panelPosition.top, true);
+  }
+  for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) ui.drag.addEventListener(event, finishDrag);
+  window.addEventListener('resize', settlePanel);
+  if (typeof ResizeObserver === 'function') new ResizeObserver(settlePanel).observe(host);
+
+  ui.hide.addEventListener('click', () => {
+    ui.panel.hidden = true;
+    ui.show.hidden = false;
+    ui.show.setAttribute('aria-expanded', 'false');
+    settlePanel();
+    ui.show.focus();
+  });
+  ui.show.addEventListener('click', () => {
+    ui.panel.hidden = false;
+    ui.show.hidden = true;
+    ui.show.setAttribute('aria-expanded', 'true');
+    settlePanel();
+    ui.hide.focus();
+    if (lastReport) paintReport(lastReport);
+  });
+  ui.fold.addEventListener('click', () => {
+    ui.body.hidden = !ui.body.hidden;
+    ui.fold.textContent = ui.body.hidden ? '+' : '−';
+    ui.fold.setAttribute('aria-expanded', String(!ui.body.hidden));
+    ui.fold.setAttribute('aria-label', ui.body.hidden ? 'Expand controls' : 'Collapse controls');
+    if (lastReport) paintReport(lastReport);
+  });
+  ui.learn.addEventListener('click', () => {
+    if (!active || !playing(active.video)) { message('Let the background sound play first.'); return; }
+    learning = { started: performance.now(), readings: [] };
+    active.adapter.configure({ learning: true });
+    message('Learning background for five seconds…');
+    buttons();
+  });
+  ui.test.addEventListener('click', () => {
+    if (!active) return;
+    active.adapter.test();
+    message('Test dip: two seconds down, then your continuous-quiet timer before restoring.');
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (lastReport) paintReport(lastReport);
+  });
+  document.addEventListener('yt-navigate-start', () => {
+    if (active || starting) disable('New page. Set your listening volume and Enable when ready.');
+  });
+  // Discovery/UI only. Audio detection and the quiet timer run on audio frames,
+  // not on this page timer, including when the worklet tab is in the background.
+  setInterval(() => {
+    const currentId = videoId();
+    if (currentId !== lastVideoId) {
+      if (active || starting) disable('New video. Enable when ready.');
+      lastVideoId = currentId;
+    }
+    const appearing = currentId && host.style.display === 'none';
+    host.style.display = currentId ? 'block' : 'none';
+    if (appearing) settlePanel();
+    if (active && (!active.video.isConnected || active.video !==
+      (document.querySelector('video.html5-main-video') || document.querySelector('video')))) {
+      disable('YouTube replaced its player. Click Enable again.');
+    }
+    if (active) {
+      syncPlaying();
+      if (performance.now() - lastReportAt > 5000) {
+        message('Audio processing is not reporting. Disable and Enable again; reload if necessary.');
+      }
+    }
+  }, 1000);
+
+  updateSettings();
+  buttons();
+  host.style.display = videoId() ? 'block' : 'none';
+  settlePanel();
+})();
